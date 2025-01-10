@@ -8,10 +8,7 @@ use std::path::Path;
 use std::str;
 
 #[cfg(not(windows))]
-use libc;
-
-#[cfg(not(windows))]
-use crate::{currentprocess::varsource::VarSource, process};
+use crate::process::Process;
 
 pub(crate) fn ensure_dir_exists<P: AsRef<Path>, F: FnOnce(&Path)>(
     path: P,
@@ -34,7 +31,7 @@ pub fn is_file<P: AsRef<Path>>(path: P) -> bool {
 }
 
 #[cfg(windows)]
-pub fn open_dir(p: &Path) -> std::io::Result<File> {
+pub fn open_dir_following_links(p: &Path) -> std::io::Result<File> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -45,14 +42,13 @@ pub fn open_dir(p: &Path) -> std::io::Result<File> {
     options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     options.open(p)
 }
+
 #[cfg(not(windows))]
-pub fn open_dir(p: &Path) -> std::io::Result<File> {
+pub fn open_dir_following_links(p: &Path) -> std::io::Result<File> {
     use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let mut options = OpenOptions::new();
     options.read(true);
-    options.custom_flags(libc::O_NOFOLLOW);
     options.open(p)
 }
 
@@ -67,14 +63,6 @@ pub(crate) fn random_string(length: usize) -> String {
     (0..length)
         .map(|_| char::from(CHARSET[rng.gen_range(0..CHARSET.len())]))
         .collect()
-}
-
-pub(crate) fn if_not_empty<S: PartialEq<str>>(s: S) -> Option<S> {
-    if s == *"" {
-        None
-    } else {
-        Some(s)
-    }
 }
 
 pub fn write_file(path: &Path, contents: &str) -> io::Result<()> {
@@ -119,7 +107,6 @@ pub(crate) fn filter_file<F: FnMut(&str) -> bool>(
 
 pub fn append_file(dest: &Path, line: &str) -> io::Result<()> {
     let mut dest_file = fs::OpenOptions::new()
-        .write(true)
         .append(true)
         .create(true)
         .open(dest)?;
@@ -131,13 +118,14 @@ pub fn append_file(dest: &Path, line: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn symlink_dir(src: &Path, dest: &Path) -> io::Result<()> {
+pub fn symlink_dir(src: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
     fn symlink_dir_inner(src: &Path, dest: &Path) -> io::Result<()> {
-        // std's symlink uses Windows's symlink function, which requires
-        // admin. We can create directory junctions the hard way without
-        // though.
-        symlink_junction_inner(src, dest)
+        // On Windows creating symlinks isn't allowed by default so if it fails
+        // we fallback to creating a directory junction.
+        // We prefer to use symlinks here because junction point paths, unlike symlinks,
+        // must always be absolute. This makes moving the rustup directory difficult.
+        std::os::windows::fs::symlink_dir(src, dest).or_else(|_| symlink_junction_inner(src, dest))
     }
     #[cfg(not(windows))]
     fn symlink_dir_inner(src: &Path, dest: &Path) -> io::Result<()> {
@@ -160,25 +148,24 @@ pub(crate) fn symlink_dir(src: &Path, dest: &Path) -> io::Result<()> {
 fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
-    use winapi::shared::minwindef::*;
-    use winapi::um::fileapi::*;
-    use winapi::um::ioapiset::*;
-    use winapi::um::winbase::*;
-    use winapi::um::winioctl::FSCTL_SET_REPARSE_POINT;
-    use winapi::um::winnt::*;
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Storage::FileSystem::*;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    use windows_sys::Win32::System::SystemServices::*;
+    use windows_sys::Win32::System::IO::*;
 
     const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
 
     #[repr(C)]
     #[allow(non_snake_case)]
     struct REPARSE_MOUNTPOINT_DATA_BUFFER {
-        ReparseTag: DWORD,
-        ReparseDataLength: DWORD,
-        Reserved: WORD,
-        ReparseTargetLength: WORD,
-        ReparseTargetMaximumLength: WORD,
-        Reserved1: WORD,
-        ReparseTarget: WCHAR,
+        ReparseTag: u32,
+        ReparseDataLength: u32,
+        Reserved: u16,
+        ReparseTargetLength: u16,
+        ReparseTargetMaximumLength: u16,
+        Reserved1: u16,
+        ReparseTarget: u16,
     }
 
     // We're using low-level APIs to create the junction, and these are more picky about paths.
@@ -203,7 +190,7 @@ fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
 
         let mut data = [0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
         let db = data.as_mut_ptr().cast::<REPARSE_MOUNTPOINT_DATA_BUFFER>();
-        let buf = &mut (*db).ReparseTarget as *mut WCHAR;
+        let buf = &mut (*db).ReparseTarget as *mut u16;
         let mut i = 0;
         // FIXME: this conversion is very hacky
         let v = br"\??\";
@@ -215,13 +202,13 @@ fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
         *buf.offset(i) = 0;
         i += 1;
         (*db).ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
-        (*db).ReparseTargetMaximumLength = (i * 2) as WORD;
-        (*db).ReparseTargetLength = ((i - 1) * 2) as WORD;
-        (*db).ReparseDataLength = (*db).ReparseTargetLength as DWORD + 12;
+        (*db).ReparseTargetMaximumLength = (i * 2) as u16;
+        (*db).ReparseTargetLength = ((i - 1) * 2) as u16;
+        (*db).ReparseDataLength = (*db).ReparseTargetLength as u32 + 12;
 
         let mut ret = 0;
         let res = DeviceIoControl(
-            h.cast(),
+            h,
             FSCTL_SET_REPARSE_POINT,
             data.as_mut_ptr().cast(),
             (*db).ReparseDataLength + 8,
@@ -239,16 +226,14 @@ fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn hardlink(src: &Path, dest: &Path) -> io::Result<()> {
-    let _ = fs::remove_file(dest);
-    fs::hard_link(src, dest)
-}
-
 pub fn remove_dir(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        if cfg!(windows) {
+        #[cfg(windows)]
+        {
             fs::remove_dir(path)
-        } else {
+        }
+        #[cfg(not(windows))]
+        {
             fs::remove_file(path)
         }
     } else {
@@ -277,17 +262,17 @@ pub(crate) fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn has_cmd(cmd: &str) -> bool {
+fn has_cmd(cmd: &str, process: &Process) -> bool {
     let cmd = format!("{}{}", cmd, env::consts::EXE_SUFFIX);
-    let path = process().var_os("PATH").unwrap_or_default();
+    let path = process.var_os("PATH").unwrap_or_default();
     env::split_paths(&path)
         .map(|p| p.join(&cmd))
         .any(|p| p.exists())
 }
 
 #[cfg(not(windows))]
-pub(crate) fn find_cmd<'a>(cmds: &[&'a str]) -> Option<&'a str> {
-    cmds.iter().cloned().find(|&s| has_cmd(s))
+pub(crate) fn find_cmd<'a>(cmds: &[&'a str], process: &Process) -> Option<&'a str> {
+    cmds.iter().cloned().find(|&s| has_cmd(s, process))
 }
 
 #[cfg(windows)]

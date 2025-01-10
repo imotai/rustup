@@ -50,7 +50,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::dist::dist::{PartialToolchainDesc, TargetTriple, ToolchainDesc};
+use crate::dist::{PartialToolchainDesc, TargetTriple, ToolchainDesc};
 
 /// Errors related to toolchains
 #[derive(Error, Debug)]
@@ -95,6 +95,14 @@ macro_rules! try_from_str {
                 $to::validate(&value)
             }
         }
+
+        impl FromStr for $to {
+            type Err = InvalidName;
+
+            fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+                $to::validate(value)
+            }
+        }
     };
     ($from:ty, $to:ident) => {
         impl TryFrom<$from> for $to {
@@ -115,15 +123,6 @@ fn validate(candidate: &str) -> Result<&str, InvalidName> {
     } else {
         Ok(normalized_name)
     }
-}
-
-/// Thunk to avoid errors like
-///  = note: `fn(&'2 str) -> Result<CustomToolchainName, <CustomToolchainName as TryFrom<&'2 str>>::Error> {<CustomToolchainName as TryFrom<&'2 str>>::try_from}` must implement `FnOnce<(&'1 str,)>`, for any lifetime `'1`...
-/// = note: ...but it actually implements `FnOnce<(&'2 str,)>`, for some specific lifetime `'2`
-pub(crate) fn partial_toolchain_desc_parser(
-    value: &str,
-) -> Result<PartialToolchainDesc, anyhow::Error> {
-    value.parse::<PartialToolchainDesc>()
 }
 
 /// A toolchain name from user input.
@@ -177,15 +176,6 @@ impl Display for ResolvableToolchainName {
     }
 }
 
-/// Thunk to avoid errors like
-///  = note: `fn(&'2 str) -> Result<CustomToolchainName, <CustomToolchainName as TryFrom<&'2 str>>::Error> {<CustomToolchainName as TryFrom<&'2 str>>::try_from}` must implement `FnOnce<(&'1 str,)>`, for any lifetime `'1`...
-/// = note: ...but it actually implements `FnOnce<(&'2 str,)>`, for some specific lifetime `'2`
-pub(crate) fn resolvable_toolchainame_parser(
-    value: &str,
-) -> Result<ResolvableToolchainName, InvalidName> {
-    ResolvableToolchainName::try_from(value)
-}
-
 /// A toolchain name from user input. MaybeToolchainName accepts 'none' or a
 /// custom or resolvable official name. Possibly this should be an Option with a
 /// local trait for our needs.
@@ -221,18 +211,9 @@ impl Display for MaybeResolvableToolchainName {
     }
 }
 
-/// Thunk to avoid errors like
-///  = note: `fn(&'2 str) -> Result<CustomToolchainName, <CustomToolchainName as TryFrom<&'2 str>>::Error> {<CustomToolchainName as TryFrom<&'2 str>>::try_from}` must implement `FnOnce<(&'1 str,)>`, for any lifetime `'1`...
-/// = note: ...but it actually implements `FnOnce<(&'2 str,)>`, for some specific lifetime `'2`
-pub(crate) fn maybe_resolvable_toolchainame_parser(
-    value: &str,
-) -> Result<MaybeResolvableToolchainName, InvalidName> {
-    MaybeResolvableToolchainName::try_from(value)
-}
-
 /// ResolvableToolchainName + none, for overriding default-has-a-value
 /// situations in the CLI with an official toolchain name or none
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) enum MaybeOfficialToolchainName {
     None,
     Some(PartialToolchainDesc),
@@ -264,22 +245,13 @@ impl Display for MaybeOfficialToolchainName {
     }
 }
 
-/// Thunk to avoid errors like
-///  = note: `fn(&'2 str) -> Result<CustomToolchainName, <CustomToolchainName as TryFrom<&'2 str>>::Error> {<CustomToolchainName as TryFrom<&'2 str>>::try_from}` must implement `FnOnce<(&'1 str,)>`, for any lifetime `'1`...
-/// = note: ...but it actually implements `FnOnce<(&'2 str,)>`, for some specific lifetime `'2`
-pub(crate) fn maybe_official_toolchainame_parser(
-    value: &str,
-) -> Result<MaybeOfficialToolchainName, InvalidName> {
-    MaybeOfficialToolchainName::try_from(value)
-}
-
 /// ToolchainName can be used in calls to Cfg that alter configuration,
 /// like setting overrides, or that depend on configuration, like calculating
 /// the toolchain directory.
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub(crate) enum ToolchainName {
-    Custom(CustomToolchainName),
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ToolchainName {
     Official(ToolchainDesc),
+    Custom(CustomToolchainName),
 }
 
 impl ToolchainName {
@@ -306,40 +278,6 @@ impl Display for ToolchainName {
             ToolchainName::Official(t) => write!(f, "{t}"),
         }
     }
-}
-
-pub(crate) fn toolchain_sort(v: &mut [ToolchainName]) {
-    use semver::{BuildMetadata, Prerelease, Version};
-
-    fn special_version(ord: u64, s: &str) -> Version {
-        Version {
-            major: 0,
-            minor: 0,
-            patch: 0,
-            pre: Prerelease::new(&format!("pre.{}.{}", ord, s.replace('_', "-"))).unwrap(),
-            build: BuildMetadata::EMPTY,
-        }
-    }
-
-    fn toolchain_sort_key(s: &str) -> Version {
-        if s.starts_with("stable") {
-            special_version(0, s)
-        } else if s.starts_with("beta") {
-            special_version(1, s)
-        } else if s.starts_with("nightly") {
-            special_version(2, s)
-        } else {
-            Version::parse(&s.replace('_', "-")).unwrap_or_else(|_| special_version(3, s))
-        }
-    }
-
-    v.sort_by(|a, b| {
-        let a_str = &format!("{a}");
-        let b_str = &format!("{b}");
-        let a_key = toolchain_sort_key(a_str);
-        let b_key = toolchain_sort_key(b_str);
-        a_key.cmp(&b_key)
-    });
 }
 
 /// ResolvableLocalToolchainName is used to process values set in
@@ -385,18 +323,12 @@ impl Display for ResolvableLocalToolchainName {
     }
 }
 
-pub(crate) fn resolvable_local_toolchainame_parser(
-    value: &str,
-) -> Result<ResolvableLocalToolchainName, InvalidName> {
-    ResolvableLocalToolchainName::try_from(value)
-}
-
 /// LocalToolchainName can be used in calls to Cfg that alter configuration,
 /// like setting overrides, or that depend on configuration, like calculating
 /// the toolchain directory. It is not used to model the RUSTUP_TOOLCHAIN
 /// variable, because that can take unresolved toolchain values that are not
 /// invalid for referring to an installed toolchain.
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LocalToolchainName {
     Named(ToolchainName),
     Path(PathBasedToolchainName),
@@ -427,6 +359,15 @@ from_variant!(
     LocalToolchainName::Path
 );
 
+impl PartialEq<ToolchainName> for LocalToolchainName {
+    fn eq(&self, other: &ToolchainName) -> bool {
+        match self {
+            LocalToolchainName::Named(n) => n == other,
+            _ => false,
+        }
+    }
+}
+
 impl Display for LocalToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -439,13 +380,9 @@ impl Display for LocalToolchainName {
 /// A custom toolchain name, but not an official toolchain name
 /// (e.g. my-custom-toolchain)
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub(crate) struct CustomToolchainName(String);
+pub struct CustomToolchainName(String);
 
 impl CustomToolchainName {
-    pub fn str(&self) -> &str {
-        &self.0
-    }
-
     fn validate(candidate: &str) -> Result<CustomToolchainName, InvalidName> {
         let candidate = validate(candidate)?;
         if candidate.parse::<PartialToolchainDesc>().is_ok()
@@ -460,6 +397,14 @@ impl CustomToolchainName {
     }
 }
 
+impl Deref for CustomToolchainName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 try_from_str!(CustomToolchainName);
 
 impl Display for CustomToolchainName {
@@ -468,20 +413,11 @@ impl Display for CustomToolchainName {
     }
 }
 
-/// Thunk to avoid
-///  = note: `fn(&'2 str) -> Result<CustomToolchainName, <CustomToolchainName as TryFrom<&'2 str>>::Error> {<CustomToolchainName as TryFrom<&'2 str>>::try_from}` must implement `FnOnce<(&'1 str,)>`, for any lifetime `'1`...
-/// = note: ...but it actually implements `FnOnce<(&'2 str,)>`, for some specific lifetime `'2`
-pub(crate) fn custom_toolchain_name_parser(
-    value: &str,
-) -> Result<CustomToolchainName, InvalidName> {
-    CustomToolchainName::try_from(value)
-}
-
 /// An toolchain specified just via its path. Relative paths enable arbitrary
 /// code execution in a rust dir, so as a partial mitigation is limited to
 /// absolute paths.
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub(crate) struct PathBasedToolchainName(PathBuf, String);
+pub struct PathBasedToolchainName(PathBuf, String);
 
 impl Display for PathBasedToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -539,53 +475,12 @@ mod tests {
     use proptest::{collection::vec, prelude::*, string::string_regex};
 
     use crate::{
-        dist::dist::PartialToolchainDesc,
+        dist::{
+            triple::known::{LIST_ARCHS, LIST_ENVS, LIST_OSES},
+            PartialToolchainDesc,
+        },
         toolchain::names::{CustomToolchainName, ResolvableToolchainName, ToolchainName},
     };
-
-    //Duplicated from triple.rs as a pragmatic step. TODO: remove duplication.
-    static LIST_ARCHS: &[&str] = &[
-        "i386",
-        "i586",
-        "i686",
-        "x86_64",
-        "arm",
-        "armv7",
-        "armv7s",
-        "aarch64",
-        "mips",
-        "mipsel",
-        "mips64",
-        "mips64el",
-        "powerpc",
-        "powerpc64",
-        "powerpc64le",
-        "riscv64gc",
-        "s390x",
-        "loongarch64",
-    ];
-    static LIST_OSES: &[&str] = &[
-        "pc-windows",
-        "unknown-linux",
-        "apple-darwin",
-        "unknown-netbsd",
-        "apple-ios",
-        "linux",
-        "rumprun-netbsd",
-        "unknown-freebsd",
-        "unknown-illumos",
-    ];
-    static LIST_ENVS: &[&str] = &[
-        "gnu",
-        "gnux32",
-        "msvc",
-        "gnueabi",
-        "gnueabihf",
-        "gnuabi64",
-        "androideabi",
-        "android",
-        "musl",
-    ];
 
     fn partial_toolchain_desc_re() -> String {
         let triple_re = format!(
@@ -594,11 +489,7 @@ mod tests {
             LIST_OSES.join("|"),
             LIST_ENVS.join("|")
         );
-        let partial_toolchain_desc_re = format!(
-            r"(nightly|beta|stable|\d{{1}}\.\d{{1,3}}(\.\d{{1,2}})?)(-(\d{{4}}-\d{{2}}-\d{{2}}))?{triple_re}"
-        );
-
-        partial_toolchain_desc_re
+        r"(nightly|beta|stable|[0-9]{1}(\.(0|[1-9][0-9]{0,2}))(\.(0|[1-9][0-9]{0,1}))?(-beta(\.(0|[1-9][1-9]{0,1}))?)?)(-([0-9]{4}-[0-9]{2}-[0-9]{2}))?".to_owned() + &triple_re
     }
 
     prop_compose! {
@@ -671,10 +562,19 @@ mod tests {
             "stable-x86_64-unknown-linux-gnu",
             "beta-x86_64-unknown-linux-gnu",
             "nightly-x86_64-unknown-linux-gnu",
+            "nightly-2015-01-01-x86_64-unknown-linux-gnu",
             "1.0.0-x86_64-unknown-linux-gnu",
             "1.2.0-x86_64-unknown-linux-gnu",
+            "1.8-beta-x86_64-apple-darwin",
+            "1.8.0-beta-x86_64-apple-darwin",
+            "1.8.0-beta.2-x86_64-apple-darwin",
+            "1.8.0-x86_64-apple-darwin",
             "1.8.0-x86_64-unknown-linux-gnu",
             "1.10.0-x86_64-unknown-linux-gnu",
+            "bar(baz)",
+            "foo#bar",
+            "the cake is a lie",
+            "this.is.not-a+semver",
         ]
         .into_iter()
         .map(|s| ToolchainName::try_from(s).unwrap())
@@ -684,16 +584,28 @@ mod tests {
             "1.8.0-x86_64-unknown-linux-gnu",
             "1.0.0-x86_64-unknown-linux-gnu",
             "nightly-x86_64-unknown-linux-gnu",
+            "nightly-2015-01-01-x86_64-unknown-linux-gnu",
             "stable-x86_64-unknown-linux-gnu",
             "1.10.0-x86_64-unknown-linux-gnu",
             "beta-x86_64-unknown-linux-gnu",
             "1.2.0-x86_64-unknown-linux-gnu",
+            // https://github.com/rust-lang/rustup/issues/1329
+            "1.8.0-x86_64-apple-darwin",
+            "1.8-beta-x86_64-apple-darwin",
+            "1.8.0-beta-x86_64-apple-darwin",
+            "1.8.0-beta.2-x86_64-apple-darwin",
+            // https://github.com/rust-lang/rustup/issues/3517
+            "foo#bar",
+            "bar(baz)",
+            "this.is.not-a+semver",
+            // https://github.com/rust-lang/rustup/issues/3168
+            "the cake is a lie",
         ]
         .into_iter()
         .map(|s| ToolchainName::try_from(s).unwrap())
         .collect::<Vec<_>>();
 
-        super::toolchain_sort(&mut v);
+        v.sort();
 
         assert_eq!(expected, v);
     }

@@ -11,21 +11,12 @@ use thiserror::Error as ThisError;
 use url::Url;
 
 use crate::{
-    currentprocess::process,
-    dist::dist::{TargetTriple, ToolchainDesc},
+    dist::{
+        manifest::{Component, Manifest},
+        Channel, TargetTriple, ToolchainDesc,
+    },
+    toolchain::{PathBasedToolchainName, ToolchainName},
 };
-use crate::{
-    dist::manifest::{Component, Manifest},
-    toolchain::names::{PathBasedToolchainName, ToolchainName},
-};
-
-const TOOLSTATE_MSG: &str =
-    "If you require these components, please install and use the latest successful build version,\n\
-     which you can find at <https://rust-lang.github.io/rustup-components-history>.\n\nAfter determining \
-     the correct date, install it with a command such as:\n\n    \
-     rustup toolchain install nightly-2018-12-27\n\n\
-     Then you can use the toolchain with commands such as:\n\n    \
-     cargo +nightly-2018-12-27 build";
 
 /// A type erasing thunk for the retry crate to permit use with anyhow. See <https://github.com/dtolnay/anyhow/issues/149>
 #[derive(Debug, ThisError)]
@@ -33,7 +24,7 @@ const TOOLSTATE_MSG: &str =
 pub struct OperationError(pub anyhow::Error);
 
 #[derive(ThisError, Debug)]
-pub(crate) enum RustupError {
+pub enum RustupError {
     #[error("partially downloaded file may have been damaged and was removed, please try again")]
     BrokenPartialFile,
     #[error("component download failed for {0}")]
@@ -79,6 +70,8 @@ pub(crate) enum RustupError {
     ReadingDirectory { name: &'static str, path: PathBuf },
     #[error("could not read {name} file: '{}'", .path.display())]
     ReadingFile { name: &'static str, path: PathBuf },
+    #[error("could not parse {name} file: '{}'", .path.display())]
+    ParsingFile { name: &'static str, path: PathBuf },
     #[error("could not remove '{}' directory: '{}'", .name, .path.display())]
     RemovingDirectory { name: &'static str, path: PathBuf },
     #[error("could not remove '{name}' file: '{}'", .path.display())]
@@ -91,21 +84,36 @@ pub(crate) enum RustupError {
     },
     #[error("command failed: '{}'", PathBuf::from(.name).display())]
     RunningCommand { name: OsString },
+    #[error(
+        "toolchain '{toolchain}' may not be able to run on this system\n\
+        note: to build software for that platform, try `rustup target add {target_triple}` instead\n\
+        note: add the `--force-non-host` flag to install the toolchain anyway"
+    )]
+    ToolchainIncompatible {
+        toolchain: String,
+        target_triple: TargetTriple,
+    },
     #[error("toolchain '{0}' is not installable")]
     ToolchainNotInstallable(String),
-    #[error("toolchain '{0}' is not installed")]
-    ToolchainNotInstalled(ToolchainName),
+    #[error(
+        "toolchain '{name}' is not installed{}",
+        if let ToolchainName::Official(t) = name {
+            format!("\nhelp: run `rustup toolchain install {t}` to install it")
+        } else {
+            String::new()
+        },
+    )]
+    ToolchainNotInstalled { name: ToolchainName },
     #[error("path '{0}' not found")]
     PathToolchainNotInstalled(PathBasedToolchainName),
     #[error(
-        "rustup could not choose a version of {} to run, because one wasn't specified explicitly, and no default is configured.\n{}",
-        process().name().unwrap_or_else(|| "Rust".into()),
-        "help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain."
+        "rustup could not choose a version of {0} to run, because one wasn't specified explicitly, and no default is configured.\n\
+        help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain."
     )]
-    ToolchainNotSelected,
+    ToolchainNotSelected(String),
     #[error("toolchain '{}' does not contain component {}{}{}", .desc, .component, suggest_message(.suggestion), if .component.contains("rust-std") {
         format!("\nnote: not all platforms have the standard library pre-compiled: https://doc.rust-lang.org/nightly/rustc/platform-support.html{}",
-            if desc.channel == "nightly" { "\nhelp: consider using `cargo build -Z build-std` instead" } else { "" }
+            if desc.channel == Channel::Nightly { "\nhelp: consider using `cargo build -Z build-std` instead" } else { "" }
         )
     } else { "".to_string() })]
     UnknownComponent {
@@ -147,81 +155,62 @@ fn suggest_message(suggestion: &Option<String>) -> String {
     }
 }
 
-fn remove_component_msg(cs: &Component, manifest: &Manifest, toolchain: &str) -> String {
-    if cs.short_name_in_manifest() == "rust-std" {
-        // We special-case rust-std as it's the stdlib so really you want to do
-        // rustup target remove
-        format!(
-            "    rustup target remove --toolchain {} {}",
-            toolchain,
-            cs.target.as_deref().unwrap_or(toolchain)
-        )
-    } else {
-        format!(
-            "    rustup component remove --toolchain {}{} {}",
-            toolchain,
-            if let Some(target) = cs.target.as_ref() {
-                format!(" --target {target}")
-            } else {
-                String::default()
-            },
-            cs.short_name(manifest)
-        )
-    }
-}
-
+/// Returns a error message indicating that certain [`Component`]s are unavailable.
+///
+/// See also [`components_missing_msg`](../dist/dist/fn.components_missing_msg.html)
+/// which generates error messages for component unavailability toolchain-wide operations.
+///
+/// # Panics
+/// This function will panic when the collection of unavailable components `cs` is empty.
 fn component_unavailable_msg(cs: &[Component], manifest: &Manifest, toolchain: &str) -> String {
-    assert!(!cs.is_empty());
-
     let mut buf = vec![];
+    match cs {
+        [] => panic!("`component_unavailable_msg` should not be called with an empty collection of unavailable components"),
+        [c] => {
+            let _ = writeln!(
+                buf,
+                "component {} is unavailable for download for channel '{}'",
+                c.description(manifest),
+                toolchain,
+            );
 
-    if cs.len() == 1 {
-        let _ = writeln!(
-            buf,
-            "component {} is unavailable for download for channel '{}'",
-            &cs[0].description(manifest),
-            toolchain,
-        );
-        if toolchain.starts_with("nightly") {
+            if toolchain.starts_with("nightly") {
+                let _ = write!(
+                    buf,
+                    "Sometimes not all components are available in any given nightly. "
+                );
+            }
+        }
+        cs => {
+            // More than one component
+            let same_target = cs
+                .iter()
+                .all(|c| c.target == cs[0].target || c.target.is_none());
+
+            let cs_str = if same_target {
+                cs.iter()
+                    .map(|c| format!("'{}'", c.short_name(manifest)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                cs.iter()
+                    .map(|c| c.description(manifest))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+
             let _ = write!(
                 buf,
-                "Sometimes not all components are available in any given nightly. "
+                "some components are unavailable for download for channel '{toolchain}': {cs_str}"
             );
+
+            if toolchain.starts_with("nightly") {
+                let _ = write!(
+                    buf,
+                    "Sometimes not all components are available in any given nightly. "
+                );
+            }
         }
-        let _ = write!(
-            buf,
-            "If you don't need the component, you can remove it with:\n\n{}",
-            remove_component_msg(&cs[0], manifest, toolchain)
-        );
-    } else {
-        // More than one component
-
-        let same_target = cs
-            .iter()
-            .all(|c| c.target == cs[0].target || c.target.is_none());
-
-        let cs_str = if same_target {
-            cs.iter()
-                .map(|c| format!("'{}'", c.short_name(manifest)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            cs.iter()
-                .map(|c| c.description(manifest))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-
-        let remove_msg = cs
-            .iter()
-            .map(|c| remove_component_msg(c, manifest, toolchain))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let _ = write!(
-            buf,
-            "some components unavailable for download for channel '{toolchain}': {cs_str}\n\
-            If you don't need the components, you can remove them with:\n\n{remove_msg}\n\n{TOOLSTATE_MSG}",
-        );
     }
 
     String::from_utf8(buf).unwrap()

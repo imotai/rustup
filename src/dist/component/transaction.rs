@@ -18,7 +18,8 @@ use crate::dist::notifications::*;
 use crate::dist::prefix::InstallPrefix;
 use crate::dist::temp;
 use crate::errors::*;
-use crate::utils::utils;
+use crate::process::Process;
+use crate::utils;
 
 /// A Transaction tracks changes to the file system, allowing them to
 /// be rolled back in case of an error. Instead of deleting or
@@ -36,23 +37,26 @@ use crate::utils::utils;
 pub struct Transaction<'a> {
     prefix: InstallPrefix,
     changes: Vec<ChangedItem<'a>>,
-    temp_cfg: &'a temp::Cfg,
+    tmp_cx: &'a temp::Context,
     notify_handler: &'a dyn Fn(Notification<'_>),
     committed: bool,
+    process: &'a Process,
 }
 
 impl<'a> Transaction<'a> {
     pub fn new(
         prefix: InstallPrefix,
-        temp_cfg: &'a temp::Cfg,
+        tmp_cx: &'a temp::Context,
         notify_handler: &'a dyn Fn(Notification<'_>),
+        process: &'a Process,
     ) -> Self {
         Transaction {
             prefix,
             changes: Vec::new(),
-            temp_cfg,
+            tmp_cx,
             notify_handler,
             committed: false,
+            process,
         }
     }
 
@@ -99,8 +103,9 @@ impl<'a> Transaction<'a> {
             &self.prefix,
             component,
             relpath,
-            self.temp_cfg,
+            self.tmp_cx,
             self.notify_handler(),
+            self.process,
         )?;
         self.change(item);
         Ok(())
@@ -114,8 +119,9 @@ impl<'a> Transaction<'a> {
             &self.prefix,
             component,
             relpath,
-            self.temp_cfg,
+            self.tmp_cx,
             self.notify_handler(),
+            self.process,
         )?;
         self.change(item);
         Ok(())
@@ -142,7 +148,7 @@ impl<'a> Transaction<'a> {
     /// This is used for arbitrarily manipulating a file.
     pub fn modify_file(&mut self, relpath: PathBuf) -> Result<()> {
         assert!(relpath.is_relative());
-        let item = ChangedItem::modify_file(&self.prefix, relpath, self.temp_cfg)?;
+        let item = ChangedItem::modify_file(&self.prefix, relpath, self.tmp_cx)?;
         self.change(item);
         Ok(())
     }
@@ -155,8 +161,14 @@ impl<'a> Transaction<'a> {
         src: &Path,
     ) -> Result<()> {
         assert!(relpath.is_relative());
-        let item =
-            ChangedItem::move_file(&self.prefix, component, relpath, src, self.notify_handler())?;
+        let item = ChangedItem::move_file(
+            &self.prefix,
+            component,
+            relpath,
+            src,
+            self.notify_handler(),
+            self.process,
+        )?;
         self.change(item);
         Ok(())
     }
@@ -164,14 +176,20 @@ impl<'a> Transaction<'a> {
     /// Recursively move a directory to a relative path of the install prefix.
     pub(crate) fn move_dir(&mut self, component: &str, relpath: PathBuf, src: &Path) -> Result<()> {
         assert!(relpath.is_relative());
-        let item =
-            ChangedItem::move_dir(&self.prefix, component, relpath, src, self.notify_handler())?;
+        let item = ChangedItem::move_dir(
+            &self.prefix,
+            component,
+            relpath,
+            src,
+            self.notify_handler(),
+            self.process,
+        )?;
         self.change(item);
         Ok(())
     }
 
-    pub(crate) fn temp(&self) -> &'a temp::Cfg {
-        self.temp_cfg
+    pub(crate) fn temp(&self) -> &'a temp::Context {
+        self.tmp_cx
     }
     pub(crate) fn notify_handler(&self) -> &'a dyn Fn(Notification<'_>) {
         self.notify_handler
@@ -180,14 +198,14 @@ impl<'a> Transaction<'a> {
 
 /// If a Transaction is dropped without being committed, the changes
 /// are automatically rolled back.
-impl<'a> Drop for Transaction<'a> {
+impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
             (self.notify_handler)(Notification::RollingBack);
             for item in self.changes.iter().rev() {
                 // ok_ntfy!(self.notify_handler,
                 //          Notification::NonFatalError,
-                match item.roll_back(&self.prefix, self.notify_handler()) {
+                match item.roll_back(&self.prefix, self.notify_handler(), self.process) {
                     Ok(()) => {}
                     Err(e) => {
                         (self.notify_handler)(Notification::NonFatalError(&e));
@@ -216,17 +234,22 @@ impl<'a> ChangedItem<'a> {
         &self,
         prefix: &InstallPrefix,
         notify: &'a dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<()> {
         use self::ChangedItem::*;
         match self {
             AddedFile(path) => utils::remove_file("component", &prefix.abs_path(path))?,
             AddedDir(path) => utils::remove_dir("component", &prefix.abs_path(path), notify)?,
             RemovedFile(path, tmp) | ModifiedFile(path, Some(tmp)) => {
-                utils::rename_file("component", tmp, &prefix.abs_path(path), notify)?
+                utils::rename("component", tmp, &prefix.abs_path(path), notify, process)?
             }
-            RemovedDir(path, tmp) => {
-                utils::rename_dir("component", &tmp.join("bk"), &prefix.abs_path(path), notify)?
-            }
+            RemovedDir(path, tmp) => utils::rename(
+                "component",
+                &tmp.join("bk"),
+                &prefix.abs_path(path),
+                notify,
+                process,
+            )?,
             ModifiedFile(path, None) => {
                 let abs_path = prefix.abs_path(path);
                 if utils::is_file(&abs_path) {
@@ -280,11 +303,12 @@ impl<'a> ChangedItem<'a> {
         prefix: &InstallPrefix,
         component: &str,
         relpath: PathBuf,
-        temp_cfg: &'a temp::Cfg,
+        tmp_cx: &'a temp::Context,
         notify: &'a dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<Self> {
         let abs_path = prefix.abs_path(&relpath);
-        let backup = temp_cfg.new_file()?;
+        let backup = tmp_cx.new_file()?;
         if !utils::path_exists(&abs_path) {
             Err(RustupError::ComponentMissingFile {
                 name: component.to_owned(),
@@ -292,7 +316,7 @@ impl<'a> ChangedItem<'a> {
             }
             .into())
         } else {
-            utils::rename_file("component", &abs_path, &backup, notify)?;
+            utils::rename("component", &abs_path, &backup, notify, process)?;
             Ok(ChangedItem::RemovedFile(relpath, backup))
         }
     }
@@ -300,11 +324,12 @@ impl<'a> ChangedItem<'a> {
         prefix: &InstallPrefix,
         component: &str,
         relpath: PathBuf,
-        temp_cfg: &'a temp::Cfg,
+        tmp_cx: &'a temp::Context,
         notify: &'a dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<Self> {
         let abs_path = prefix.abs_path(&relpath);
-        let backup = temp_cfg.new_directory()?;
+        let backup = tmp_cx.new_directory()?;
         if !utils::path_exists(&abs_path) {
             Err(RustupError::ComponentMissingDir {
                 name: component.to_owned(),
@@ -312,19 +337,19 @@ impl<'a> ChangedItem<'a> {
             }
             .into())
         } else {
-            utils::rename_dir("component", &abs_path, &backup.join("bk"), notify)?;
+            utils::rename("component", &abs_path, &backup.join("bk"), notify, process)?;
             Ok(ChangedItem::RemovedDir(relpath, backup))
         }
     }
     fn modify_file(
         prefix: &InstallPrefix,
         relpath: PathBuf,
-        temp_cfg: &'a temp::Cfg,
+        tmp_cx: &'a temp::Context,
     ) -> Result<Self> {
         let abs_path = prefix.abs_path(&relpath);
 
         if utils::is_file(&abs_path) {
-            let backup = temp_cfg.new_file()?;
+            let backup = tmp_cx.new_file()?;
             utils::copy_file(&abs_path, &backup)?;
             Ok(ChangedItem::ModifiedFile(relpath, Some(backup)))
         } else {
@@ -340,9 +365,10 @@ impl<'a> ChangedItem<'a> {
         relpath: PathBuf,
         src: &Path,
         notify: &'a dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<Self> {
         let abs_path = ChangedItem::dest_abs_path(prefix, component, &relpath)?;
-        utils::rename_file("component", src, &abs_path, notify)?;
+        utils::rename("component", src, &abs_path, notify, process)?;
         Ok(ChangedItem::AddedFile(relpath))
     }
     fn move_dir(
@@ -351,9 +377,10 @@ impl<'a> ChangedItem<'a> {
         relpath: PathBuf,
         src: &Path,
         notify: &'a dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<Self> {
         let abs_path = ChangedItem::dest_abs_path(prefix, component, &relpath)?;
-        utils::rename_dir("component", src, &abs_path, notify)?;
+        utils::rename("component", src, &abs_path, notify, process)?;
         Ok(ChangedItem::AddedDir(relpath))
     }
 }

@@ -1,51 +1,8 @@
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
+
 use regex::Regex;
 
-// These lists contain the targets known to rustup, and used to build
-// the PartialTargetTriple.
-
-static LIST_ARCHS: &[&str] = &[
-    "i386",
-    "i586",
-    "i686",
-    "x86_64",
-    "arm",
-    "armv7",
-    "armv7s",
-    "aarch64",
-    "mips",
-    "mipsel",
-    "mips64",
-    "mips64el",
-    "powerpc",
-    "powerpc64",
-    "powerpc64le",
-    "riscv64gc",
-    "s390x",
-    "loongarch64",
-];
-static LIST_OSES: &[&str] = &[
-    "pc-windows",
-    "unknown-linux",
-    "apple-darwin",
-    "unknown-netbsd",
-    "apple-ios",
-    "linux",
-    "rumprun-netbsd",
-    "unknown-freebsd",
-    "unknown-illumos",
-];
-static LIST_ENVS: &[&str] = &[
-    "gnu",
-    "gnux32",
-    "msvc",
-    "gnueabi",
-    "gnueabihf",
-    "gnuabi64",
-    "androideabi",
-    "android",
-    "musl",
-];
+pub mod known;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PartialTargetTriple {
@@ -68,15 +25,16 @@ impl PartialTargetTriple {
         // we can count  on all triple components being
         // delineated by it.
         let name = format!("-{name}");
-        lazy_static! {
-            static ref PATTERN: String = format!(
+        static RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(&format!(
                 r"^(?:-({}))?(?:-({}))?(?:-({}))?$",
-                LIST_ARCHS.join("|"),
-                LIST_OSES.join("|"),
-                LIST_ENVS.join("|")
-            );
-            static ref RE: Regex = Regex::new(&PATTERN).unwrap();
-        }
+                known::LIST_ARCHS.join("|"),
+                known::LIST_OSES.join("|"),
+                known::LIST_ENVS.join("|")
+            ))
+            .unwrap()
+        });
+
         RE.captures(&name).map(|c| {
             fn fn_map(s: &str) -> Option<String> {
                 if s.is_empty() {
@@ -97,8 +55,6 @@ impl PartialTargetTriple {
 
 #[cfg(test)]
 mod test {
-    use rustup_macros::unit_test as test;
-
     use super::*;
 
     #[test]
