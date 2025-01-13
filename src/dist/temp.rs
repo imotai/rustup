@@ -4,12 +4,10 @@ use std::io;
 use std::ops;
 use std::path::{Path, PathBuf};
 
-pub(crate) use anyhow::{Context, Result};
+pub(crate) use anyhow::{Context as _, Result};
 use thiserror::Error as ThisError;
 
-use crate::utils::notify::NotificationLevel;
-use crate::utils::raw;
-use crate::utils::utils;
+use crate::utils::{self, notify::NotificationLevel, raw};
 
 #[derive(Debug, ThisError)]
 pub(crate) enum CreatingError {
@@ -22,6 +20,55 @@ pub(crate) enum CreatingError {
 }
 
 #[derive(Debug)]
+pub(crate) struct Dir<'a> {
+    cfg: &'a Context,
+    path: PathBuf,
+}
+
+impl ops::Deref for Dir<'_> {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.path.as_path()
+    }
+}
+
+impl Drop for Dir<'_> {
+    fn drop(&mut self) {
+        if raw::is_directory(&self.path) {
+            let n = Notification::DirectoryDeletion(
+                &self.path,
+                remove_dir_all::remove_dir_all(&self.path),
+            );
+            (self.cfg.notify_handler)(n);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct File<'a> {
+    cfg: &'a Context,
+    path: PathBuf,
+}
+
+impl ops::Deref for File<'_> {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.path.as_path()
+    }
+}
+
+impl Drop for File<'_> {
+    fn drop(&mut self) {
+        if raw::is_file(&self.path) {
+            let n = Notification::FileDeletion(&self.path, fs::remove_file(&self.path));
+            (self.cfg.notify_handler)(n);
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum Notification<'a> {
     CreatingRoot(&'a Path),
     CreatingFile(&'a Path),
@@ -30,32 +77,14 @@ pub enum Notification<'a> {
     DirectoryDeletion(&'a Path, io::Result<()>),
 }
 
-pub struct Cfg {
-    root_directory: PathBuf,
-    pub dist_server: String,
-    notify_handler: Box<dyn Fn(Notification<'_>)>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Dir<'a> {
-    cfg: &'a Cfg,
-    path: PathBuf,
-}
-
-#[derive(Debug)]
-pub struct File<'a> {
-    cfg: &'a Cfg,
-    path: PathBuf,
-}
-
-impl<'a> Notification<'a> {
+impl Notification<'_> {
     pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
-            CreatingRoot(_) | CreatingFile(_) | CreatingDirectory(_) => NotificationLevel::Verbose,
+            CreatingRoot(_) | CreatingFile(_) | CreatingDirectory(_) => NotificationLevel::Debug,
             FileDeletion(_, result) | DirectoryDeletion(_, result) => {
                 if result.is_ok() {
-                    NotificationLevel::Verbose
+                    NotificationLevel::Debug
                 } else {
                     NotificationLevel::Warn
                 }
@@ -64,7 +93,7 @@ impl<'a> Notification<'a> {
     }
 }
 
-impl<'a> Display for Notification<'a> {
+impl Display for Notification<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
         use self::Notification::*;
         match self {
@@ -89,7 +118,13 @@ impl<'a> Display for Notification<'a> {
     }
 }
 
-impl Cfg {
+pub struct Context {
+    root_directory: PathBuf,
+    pub dist_server: String,
+    notify_handler: Box<dyn Fn(Notification<'_>)>,
+}
+
+impl Context {
     pub fn new(
         root_directory: PathBuf,
         dist_server: &str,
@@ -158,52 +193,15 @@ impl Cfg {
     }
 
     pub(crate) fn clean(&self) {
-        utils::delete_dir_contents(&self.root_directory);
+        utils::delete_dir_contents_following_links(&self.root_directory);
     }
 }
 
-impl fmt::Debug for Cfg {
+impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cfg")
             .field("root_directory", &self.root_directory)
             .field("notify_handler", &"...")
             .finish()
-    }
-}
-
-impl<'a> ops::Deref for Dir<'a> {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        self.path.as_path()
-    }
-}
-
-impl<'a> ops::Deref for File<'a> {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        self.path.as_path()
-    }
-}
-
-impl<'a> Drop for Dir<'a> {
-    fn drop(&mut self) {
-        if raw::is_directory(&self.path) {
-            let n = Notification::DirectoryDeletion(
-                &self.path,
-                remove_dir_all::remove_dir_all(&self.path),
-            );
-            (self.cfg.notify_handler)(n);
-        }
-    }
-}
-
-impl<'a> Drop for File<'a> {
-    fn drop(&mut self) {
-        if raw::is_file(&self.path) {
-            let n = Notification::FileDeletion(&self.path, fs::remove_file(&self.path));
-            (self.cfg.notify_handler)(n);
-        }
     }
 }

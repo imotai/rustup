@@ -8,27 +8,28 @@ use std::{
     fmt::Debug,
     fs,
     io::{self, Write},
+    mem,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, RwLock, RwLockWriteGuard},
+    sync::{Arc, LazyLock, RwLock, RwLockWriteGuard},
     time::Instant,
 };
 
 use enum_map::{enum_map, Enum, EnumMap};
-use lazy_static::lazy_static;
-use once_cell::sync::Lazy;
+use tempfile::TempDir;
 use url::Url;
 
 use crate::cli::rustup_mode;
-use crate::currentprocess;
+use crate::process;
 use crate::test as rustup_test;
 use crate::test::const_dist_dir;
 use crate::test::this_host_triple;
-use crate::utils::{raw, utils};
+use crate::utils;
 
 use super::{
     dist::{
-        change_channel_date, ManifestVersion, MockChannel, MockComponent, MockDistServer,
+        change_channel_date, MockChannel, MockComponent, MockDistServer, MockManifestVersion,
         MockPackage, MockTargetedPackage,
     },
     topical_doc_data, MockComponentBuilder, MockFile, MockInstallerBuilder,
@@ -86,11 +87,15 @@ pub enum Scenario {
     SimpleV1,
     /// One date, v2 manifests, MULTI_ARCH1 host
     MultiHost,
+    /// One date, v2 manifests, beta with tag
+    BetaTag,
     /// Two dates, v2 manifests, everything unavailable in second date.
     Unavailable,
     /// Two dates, v2 manifests, RLS unavailable in first date, restored on second.
     UnavailableRls,
-    /// Three dates, v2 manifests, RLS available in first and last, not middle
+    /// Two dates, v2 manifests, RLS available in first stable, removed on second.
+    RemovedRls,
+    /// Three dates, v2 manifests, RLS available in first and second, not last
     MissingComponent,
     /// Three dates, v2 manifests, RLS available in first, middle missing nightly
     MissingNightly,
@@ -112,8 +117,8 @@ pub static MULTI_ARCH1: &str = "i686-unknown-linux-gnu";
 #[cfg(not(target_pointer_width = "64"))]
 pub static MULTI_ARCH1: &str = "x86_64-unknown-linux-gnu";
 
-static CONST_TEST_STATE: Lazy<ConstState> =
-    Lazy::new(|| ConstState::new(const_dist_dir().unwrap()));
+static CONST_TEST_STATE: LazyLock<ConstState> =
+    LazyLock::new(|| ConstState::new(const_dist_dir().unwrap()));
 
 /// Const test state - test dirs that can be reused across tests.
 struct ConstState {
@@ -128,7 +133,7 @@ struct ConstState {
 /// environments. In doing this we can ensure that new test environment creation
 /// does not result in ETXTBSY because the FDs in question happen to be in
 /// newly `fork()`d but not yet `exec()`d subprocesses of other tests.
-pub static CMD_LOCK: Lazy<RwLock<usize>> = Lazy::new(|| RwLock::new(0));
+pub static CMD_LOCK: LazyLock<RwLock<usize>> = LazyLock::new(|| RwLock::new(0));
 
 impl ConstState {
     fn new(const_dist_dir: tempfile::TempDir) -> Self {
@@ -139,6 +144,7 @@ impl ConstState {
                 Scenario::ArchivesV2 => RwLock::new(None),
                 Scenario::ArchivesV2_2015_01_01 => RwLock::new(None),
                 Scenario::ArchivesV2TwoVersions => RwLock::new(None),
+                Scenario::BetaTag => RwLock::new(None),
                 Scenario::Empty => RwLock::new(None),
                 Scenario::Full => RwLock::new(None),
                 Scenario::HostGoesMissingBefore => RwLock::new(None),
@@ -148,6 +154,7 @@ impl ConstState {
                 Scenario::MissingNightly => RwLock::new(None),
                 Scenario::MultiHost => RwLock::new(None),
                 Scenario::None => RwLock::new(None),
+                Scenario::RemovedRls => RwLock::new(None),
                 Scenario::SimpleV1 => RwLock::new(None),
                 Scenario::SimpleV2 => RwLock::new(None),
                 Scenario::Unavailable => RwLock::new(None),
@@ -183,7 +190,7 @@ impl ConstState {
 }
 
 /// State a test can interact and mutate
-pub fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDir, Config) {
+pub async fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDir, Config) {
     // Unset env variables that will break our testing
     env::remove_var("RUSTUP_UPDATE_ROOT");
     env::remove_var("RUSTUP_TOOLCHAIN");
@@ -288,10 +295,14 @@ pub fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDir,
     // Make sure the host triple matches the build triple. Otherwise testing a 32-bit build of
     // rustup on a 64-bit machine will fail, because the tests do not have the host detection
     // functionality built in.
-    config.run("rustup", ["set", "default-host", &this_host_triple()], &[]);
+    config
+        .run("rustup", ["set", "default-host", &this_host_triple()], &[])
+        .await;
 
     // Set the auto update mode to disable, as most tests do not want to update rustup itself during the test.
-    config.run("rustup", ["set", "auto-self-update", "disable"], &[]);
+    config
+        .run("rustup", ["set", "auto-self-update", "disable"], &[])
+        .await;
 
     // Create some custom toolchains
     create_custom_toolchains(&config.customdir);
@@ -299,25 +310,179 @@ pub fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDir,
     (test_dir, config)
 }
 
-/// Run this to create the test environment containing rustup, and
-/// a mock dist server.
-pub fn test(s: Scenario, f: &dyn Fn(&mut Config)) {
-    // Things we might cache or what not
+pub struct SelfUpdateTestContext {
+    pub config: Config,
+    _test_dir: TempDir,
+    self_dist_tmp: TempDir,
+}
 
-    // Mutable dist server - working toward elimination
-    let test_dist_dir = crate::test::test_dist_dir().unwrap();
-    create_mock_dist_server(test_dist_dir.path(), s);
+impl SelfUpdateTestContext {
+    pub async fn new(version: &str) -> Self {
+        let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
 
-    // Things that are just about the test itself
-    let (_test_dir, mut config) = setup_test_state(test_dist_dir);
-    // Pulled out of setup_test_state for clarity: the long term intent is to
-    // not have this at all.
-    if s != Scenario::None {
-        config.distdir = Some(config.test_dist_dir.path().to_path_buf());
+        // Create a mock self-update server
+        let self_dist_tmp = tempfile::Builder::new()
+            .prefix("self_dist")
+            .tempdir_in(&cx.config.test_root_dir)
+            .unwrap();
+        let self_dist = self_dist_tmp.path();
+
+        let root_url = create_local_update_server(self_dist, &cx.config.exedir, version);
+        cx.config.rustup_update_root = Some(root_url);
+
+        let trip = this_host_triple();
+        let dist_dir = self_dist.join(format!("archive/{version}/{trip}"));
+        let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
+        let dist_tmp = dist_dir.join("rustup-init-tmp");
+
+        // Modify the exe so it hashes different
+        // 1) move out of the way the file
+        fs::rename(&dist_exe, &dist_tmp).unwrap();
+        // 2) copy it
+        fs::copy(dist_tmp, &dist_exe).unwrap();
+        // modify it
+        let mut dest_file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(dist_exe)
+            .unwrap();
+        writeln!(dest_file).unwrap();
+
+        Self {
+            config: cx.config,
+            _test_dir: cx._test_dir,
+            self_dist_tmp,
+        }
     }
 
-    // Run the test
-    f(&mut config);
+    pub fn path(&self) -> &Path {
+        self.self_dist_tmp.path()
+    }
+}
+
+pub struct CliTestContext {
+    pub config: Config,
+    _test_dir: TempDir,
+}
+
+impl CliTestContext {
+    pub async fn new(scenario: Scenario) -> Self {
+        // Things we might cache or what not
+
+        // Mutable dist server - working toward elimination
+        let test_dist_dir = crate::test::test_dist_dir().unwrap();
+        create_mock_dist_server(test_dist_dir.path(), scenario);
+
+        // Things that are just about the test itself
+        let (_test_dir, mut config) = setup_test_state(test_dist_dir).await;
+        // Pulled out of setup_test_state for clarity: the long term intent is to
+        // not have this at all.
+        if scenario != Scenario::None {
+            config.distdir = Some(config.test_dist_dir.path().to_path_buf());
+        }
+
+        Self { config, _test_dir }
+    }
+
+    /// Move the dist server to the specified scenario and restore it
+    /// afterwards.
+    pub fn with_dist_dir(&mut self, scenario: Scenario) -> DistDirGuard<'_> {
+        self.config.distdir = Some(CONST_TEST_STATE.dist_server_for(scenario).unwrap());
+        DistDirGuard { inner: self }
+    }
+
+    pub fn with_update_server(&mut self, version: &str) -> UpdateServerGuard {
+        let self_dist_tmp = tempfile::Builder::new()
+            .prefix("self_dist")
+            .tempdir()
+            .unwrap();
+        let self_dist = self_dist_tmp.path();
+
+        let root_url = create_local_update_server(self_dist, &self.config.exedir, version);
+        let trip = this_host_triple();
+        let dist_dir = self_dist.join(format!("archive/{version}/{trip}"));
+        let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
+        let dist_tmp = dist_dir.join("rustup-init-tmp");
+
+        // Modify the exe so it hashes different
+        // 1) move out of the way the file
+        fs::rename(&dist_exe, &dist_tmp).unwrap();
+        // 2) copy it
+        fs::copy(dist_tmp, &dist_exe).unwrap();
+        // modify it
+        let mut dest_file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(dist_exe)
+            .unwrap();
+        writeln!(dest_file).unwrap();
+
+        self.config.rustup_update_root = Some(root_url);
+        UpdateServerGuard {
+            _self_dist: self_dist_tmp,
+        }
+    }
+
+    pub fn change_dir(&mut self, path: &Path) -> WorkDirGuard<'_> {
+        let prev = self.config.workdir.replace(path.to_owned());
+        WorkDirGuard { inner: self, prev }
+    }
+}
+
+#[must_use]
+pub struct UpdateServerGuard {
+    _self_dist: TempDir,
+}
+
+#[must_use]
+pub struct WorkDirGuard<'a> {
+    inner: &'a mut CliTestContext,
+    prev: PathBuf,
+}
+
+impl Deref for WorkDirGuard<'_> {
+    type Target = CliTestContext;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.inner
+    }
+}
+
+impl DerefMut for WorkDirGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+    }
+}
+
+impl Drop for WorkDirGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.config.workdir.replace(mem::take(&mut self.prev));
+    }
+}
+
+#[must_use]
+pub struct DistDirGuard<'a> {
+    inner: &'a mut CliTestContext,
+}
+
+impl Deref for DistDirGuard<'_> {
+    type Target = CliTestContext;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.inner
+    }
+}
+
+impl DerefMut for DistDirGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+    }
+}
+
+impl Drop for DistDirGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.config.distdir = None;
+    }
 }
 
 fn create_local_update_server(self_dist: &Path, exedir: &Path, version: &str) -> String {
@@ -336,74 +501,6 @@ fn create_local_update_server(self_dist: &Path, exedir: &Path, version: &str) ->
     root_url
 }
 
-pub fn self_update_setup(f: &dyn Fn(&mut Config, &Path), version: &str) {
-    test(Scenario::SimpleV2, &|config| {
-        // Create a mock self-update server
-
-        let self_dist_tmp = tempfile::Builder::new()
-            .prefix("self_dist")
-            .tempdir_in(&config.test_root_dir)
-            .unwrap();
-        let self_dist = self_dist_tmp.path();
-
-        let root_url = create_local_update_server(self_dist, &config.exedir, version);
-        config.rustup_update_root = Some(root_url);
-
-        let trip = this_host_triple();
-        let dist_dir = self_dist.join(format!("archive/{version}/{trip}"));
-        let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
-        let dist_tmp = dist_dir.join("rustup-init-tmp");
-
-        // Modify the exe so it hashes different
-        // 1) move out of the way the file
-        fs::rename(&dist_exe, &dist_tmp).unwrap();
-        // 2) copy it
-        fs::copy(dist_tmp, &dist_exe).unwrap();
-        // modify it
-        let mut dest_file = fs::OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(dist_exe)
-            .unwrap();
-        writeln!(dest_file).unwrap();
-
-        f(config, self_dist);
-    });
-}
-
-pub fn with_update_server(config: &mut Config, version: &str, f: &dyn Fn(&mut Config)) {
-    let self_dist_tmp = tempfile::Builder::new()
-        .prefix("self_dist")
-        .tempdir()
-        .unwrap();
-    let self_dist = self_dist_tmp.path();
-
-    let root_url = create_local_update_server(self_dist, &config.exedir, version);
-    let trip = this_host_triple();
-    let dist_dir = self_dist.join(format!("archive/{version}/{trip}"));
-    let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
-    let dist_tmp = dist_dir.join("rustup-init-tmp");
-
-    // Modify the exe so it hashes different
-    // 1) move out of the way the file
-    fs::rename(&dist_exe, &dist_tmp).unwrap();
-    // 2) copy it
-    fs::copy(dist_tmp, &dist_exe).unwrap();
-    // modify it
-    let mut dest_file = fs::OpenOptions::new()
-        .write(true)
-        .append(true)
-        .create(true)
-        .open(dist_exe)
-        .unwrap();
-    writeln!(dest_file).unwrap();
-
-    config.rustup_update_root = Some(root_url);
-    f(config);
-    config.rustup_update_root = None;
-}
-
 pub fn output_release_file(dist_dir: &Path, schema: &str, version: &str) {
     let contents = format!(
         r#"
@@ -418,28 +515,6 @@ version = "{version}"
 impl Config {
     pub fn current_dir(&self) -> PathBuf {
         self.workdir.borrow().clone()
-    }
-
-    pub fn change_dir(&mut self, path: &Path, f: &dyn Fn(&mut Config)) {
-        let prev = self.workdir.replace(path.to_owned());
-        f(self);
-        *self.workdir.borrow_mut() = prev;
-    }
-
-    pub fn create_rustup_sh_metadata(&self) {
-        let rustup_dir = self.homedir.join(".rustup");
-        fs::create_dir_all(&rustup_dir).unwrap();
-        let version_file = rustup_dir.join("rustup-version");
-        raw::write_file(&version_file, "").unwrap();
-    }
-
-    /// Move the dist server to the specified scenario and restore it
-    /// afterwards.
-    pub fn with_scenario(&mut self, s: Scenario, f: &dyn Fn(&mut Config)) {
-        let dist_path = CONST_TEST_STATE.dist_server_for(s).unwrap();
-        self.const_dist_dir = Some(dist_path);
-        f(self);
-        self.const_dist_dir = None;
     }
 
     pub fn cmd<I, A>(&self, name: &str, args: I) -> Command
@@ -513,9 +588,8 @@ impl Config {
     }
 
     /// Expect an ok status
-    #[track_caller]
-    pub fn expect_ok(&mut self, args: &[&str]) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_ok(&mut self, args: &[&str]) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if !out.ok {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -524,9 +598,8 @@ impl Config {
     }
 
     /// Expect an err status and a string in stderr
-    #[track_caller]
-    pub fn expect_err(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_err(&self, args: &[&str], expected: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if out.ok || !out.stderr.contains(expected) {
             print_command(args, &out);
             println!("expected.ok: false");
@@ -536,9 +609,8 @@ impl Config {
     }
 
     /// Expect an ok status and a string in stdout
-    #[track_caller]
-    pub fn expect_stdout_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_stdout_ok(&self, args: &[&str], expected: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if !out.ok || !out.stdout.contains(expected) {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -547,9 +619,8 @@ impl Config {
         }
     }
 
-    #[track_caller]
-    pub fn expect_not_stdout_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_not_stdout_ok(&self, args: &[&str], expected: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if !out.ok || out.stdout.contains(expected) {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -558,9 +629,8 @@ impl Config {
         }
     }
 
-    #[track_caller]
-    pub fn expect_not_stderr_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_not_stderr_ok(&self, args: &[&str], expected: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if !out.ok || out.stderr.contains(expected) {
             print_command(args, &out);
             println!("expected.ok: false");
@@ -569,9 +639,8 @@ impl Config {
         }
     }
 
-    #[track_caller]
-    pub fn expect_not_stderr_err(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_not_stderr_err(&self, args: &[&str], expected: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if out.ok || out.stderr.contains(expected) {
             print_command(args, &out);
             println!("expected.ok: false");
@@ -581,9 +650,8 @@ impl Config {
     }
 
     /// Expect an ok status and a string in stderr
-    #[track_caller]
-    pub fn expect_stderr_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_stderr_ok(&self, args: &[&str], expected: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if !out.ok || !out.stderr.contains(expected) {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -593,9 +661,8 @@ impl Config {
     }
 
     /// Expect an exact strings on stdout/stderr with an ok status code
-    #[track_caller]
-    pub fn expect_ok_ex(&mut self, args: &[&str], stdout: &str, stderr: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_ok_ex(&mut self, args: &[&str], stdout: &str, stderr: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if !out.ok || out.stdout != stdout || out.stderr != stderr {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -608,9 +675,8 @@ impl Config {
     }
 
     /// Expect an exact strings on stdout/stderr with an error status code
-    #[track_caller]
-    pub fn expect_err_ex(&self, args: &[&str], stdout: &str, stderr: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_err_ex(&self, args: &[&str], stdout: &str, stderr: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if out.ok || out.stdout != stdout || out.stderr != stderr {
             print_command(args, &out);
             println!("expected.ok: false");
@@ -628,9 +694,8 @@ impl Config {
         }
     }
 
-    #[track_caller]
-    pub fn expect_ok_contains(&self, args: &[&str], stdout: &str, stderr: &str) {
-        let out = self.run(args[0], &args[1..], &[]);
+    pub async fn expect_ok_contains(&self, args: &[&str], stdout: &str, stderr: &str) {
+        let out = self.run(args[0], &args[1..], &[]).await;
         if !out.ok || !out.stdout.contains(stdout) || !out.stderr.contains(stderr) {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -640,10 +705,9 @@ impl Config {
         }
     }
 
-    #[track_caller]
-    pub fn expect_ok_eq(&self, args1: &[&str], args2: &[&str]) {
-        let out1 = self.run(args1[0], &args1[1..], &[]);
-        let out2 = self.run(args2[0], &args2[1..], &[]);
+    pub async fn expect_ok_eq(&self, args1: &[&str], args2: &[&str]) {
+        let out1 = self.run(args1[0], &args1[1..], &[]).await;
+        let out2 = self.run(args2[0], &args2[1..], &[]).await;
         if !out1.ok || !out2.ok || out1.stdout != out2.stdout || out1.stderr != out2.stderr {
             print_command(args1, &out1);
             println!("expected.ok: true");
@@ -653,9 +717,8 @@ impl Config {
         }
     }
 
-    #[track_caller]
-    pub fn expect_component_executable(&self, cmd: &str) {
-        let out1 = self.run(cmd, ["--version"], &[]);
+    pub async fn expect_component_executable(&self, cmd: &str) {
+        let out1 = self.run(cmd, ["--version"], &[]).await;
         if !out1.ok {
             print_command(&[cmd, "--version"], &out1);
             println!("expected.ok: true");
@@ -663,9 +726,8 @@ impl Config {
         }
     }
 
-    #[track_caller]
-    pub fn expect_component_not_executable(&self, cmd: &str) {
-        let out1 = self.run(cmd, ["--version"], &[]);
+    pub async fn expect_component_not_executable(&self, cmd: &str) {
+        let out1 = self.run(cmd, ["--version"], &[]).await;
         if out1.ok {
             print_command(&[cmd, "--version"], &out1);
             println!("expected.ok: false");
@@ -673,7 +735,7 @@ impl Config {
         }
     }
 
-    pub fn run<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> SanitizedOutput
+    pub async fn run<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> SanitizedOutput
     where
         I: IntoIterator<Item = A> + Clone + Debug,
         A: AsRef<OsStr>,
@@ -681,7 +743,7 @@ impl Config {
         let inprocess = allow_inprocess(name, args.clone());
         let start = Instant::now();
         let out = if inprocess {
-            self.run_inprocess(name, args.clone(), env)
+            self.run_inprocess(name, args.clone(), env).await
         } else {
             self.run_subprocess(name, args.clone(), env)
         };
@@ -702,8 +764,13 @@ impl Config {
         output
     }
 
-    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
-    pub(crate) fn run_inprocess<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> Output
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn run_inprocess<I, A>(
+        &self,
+        name: &str,
+        args: I,
+        env: &[(&str, &str)],
+    ) -> Output
     where
         I: IntoIterator<Item = A>,
         A: AsRef<OsStr>,
@@ -724,20 +791,26 @@ impl Config {
                     .into_boxed_str(),
             );
         }
-        let tp = currentprocess::TestProcess::new(&*self.workdir.borrow(), &arg_strings, vars, "");
-        let process_res = currentprocess::with(tp.clone().into(), rustup_mode::main);
+
+        let tp = process::TestProcess::new(&*self.workdir.borrow(), &arg_strings, vars, "");
+        let process_res = rustup_mode::main(
+            tp.process.current_dir().unwrap(),
+            &tp.process,
+            tp.console_filter.clone(),
+        )
+        .await;
         // convert Err's into an ec
         let ec = match process_res {
             Ok(process_res) => process_res,
             Err(e) => {
-                currentprocess::with(tp.clone().into(), || crate::cli::common::report_error(&e));
+                crate::cli::common::report_error(&e, &tp.process);
                 utils::ExitCode(1)
             }
         };
         Output {
             status: Some(ec.0),
-            stderr: tp.get_stderr(),
-            stdout: tp.get_stdout(),
+            stderr: tp.stderr(),
+            stdout: tp.stdout(),
         }
     }
 
@@ -917,6 +990,14 @@ impl Release {
         Release::new("beta", version, date, version)
     }
 
+    fn beta_with_tag(tag: Option<&str>, version: &str, date: &str) -> Self {
+        let channel = match tag {
+            Some(tag) => format!("{version}-beta.{tag}"),
+            None => format!("{version}-beta"),
+        };
+        Release::new(&channel, version, date, version)
+    }
+
     fn with_rls(mut self, status: RlsStatus) -> Self {
         self.rls = status;
         self
@@ -978,7 +1059,7 @@ impl Release {
         }
     }
 
-    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn link(&self, path: &Path) {
         // Also create the manifests for releases by version
         let _ = hard_link(
@@ -1031,7 +1112,7 @@ impl Release {
 }
 
 // Creates a mock dist server populated with some test data
-#[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+#[tracing::instrument(level = "trace", skip_all)]
 fn create_mock_dist_server(path: &Path, s: Scenario) {
     let chans = match s {
         Scenario::None => return,
@@ -1079,6 +1160,10 @@ fn create_mock_dist_server(path: &Path, s: Scenario) {
                 Release::stable("1.1.0", "2015-01-02"),
             ]
         }
+        Scenario::RemovedRls => vec![
+            Release::stable("1.78.0", "2024-05-01"),
+            Release::stable("1.79.0", "2024-06-15").with_rls(RlsStatus::Unavailable),
+        ],
         Scenario::SimpleV1 | Scenario::SimpleV2 => vec![
             Release::new("nightly", "1.3.0", "2015-01-02", "2").with_rls(RlsStatus::Renamed),
             Release::beta("1.2.0", "2015-01-02"),
@@ -1088,6 +1173,13 @@ fn create_mock_dist_server(path: &Path, s: Scenario) {
             Release::new("nightly", "1.3.0", "2015-01-02", "2").multi_arch(),
             Release::beta("1.2.0", "2015-01-02").multi_arch(),
             Release::stable("1.1.0", "2015-01-02").multi_arch(),
+        ],
+        Scenario::BetaTag => vec![
+            Release::beta("1.78.0", "2024-03-19"),
+            Release::beta_with_tag(None, "1.78.0", "2024-03-19"),
+            Release::beta("1.79.0", "2024-05-03"),
+            Release::beta_with_tag(Some("1"), "1.79.0", "2024-04-29"),
+            Release::beta_with_tag(Some("2"), "1.79.0", "2024-05-03"),
         ],
         Scenario::HostGoesMissingBefore => {
             vec![Release::new("nightly", "1.3.0", "2019-12-09", "1")]
@@ -1109,20 +1201,22 @@ fn create_mock_dist_server(path: &Path, s: Scenario) {
     let vs = match s {
         Scenario::None => unreachable!("None exits above"),
         Scenario::Empty => vec![],
-        Scenario::Full => vec![ManifestVersion::V1, ManifestVersion::V2],
-        Scenario::SimpleV1 | Scenario::ArchivesV1 => vec![ManifestVersion::V1],
+        Scenario::Full => vec![MockManifestVersion::V1, MockManifestVersion::V2],
+        Scenario::SimpleV1 | Scenario::ArchivesV1 => vec![MockManifestVersion::V1],
         Scenario::SimpleV2
         | Scenario::ArchivesV2
         | Scenario::ArchivesV2_2015_01_01
         | Scenario::ArchivesV2TwoVersions
+        | Scenario::BetaTag
         | Scenario::MultiHost
         | Scenario::Unavailable
         | Scenario::UnavailableRls
+        | Scenario::RemovedRls
         | Scenario::MissingNightly
         | Scenario::HostGoesMissingBefore
         | Scenario::HostGoesMissingAfter
         | Scenario::MissingComponent
-        | Scenario::MissingComponentMulti => vec![ManifestVersion::V2],
+        | Scenario::MissingComponentMulti => vec![MockManifestVersion::V2],
     };
 
     MockDistServer {
@@ -1501,39 +1595,39 @@ fn build_combined_installer(components: &[&MockInstallerBuilder]) -> MockInstall
 /// and then we store some associated files next to it which indicate
 /// the version/version hash information.
 fn mock_bin(name: &str, version: &str, version_hash: &str) -> Vec<MockFile> {
-    lazy_static! {
-        static ref MOCK_BIN: Arc<Vec<u8>> = {
-            // Create a temp directory to hold the source and the output
-            let tempdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-            let source_path = tempdir.path().join("in.rs");
-            let dest_path = tempdir.path().join(format!("out{EXE_SUFFIX}"));
+    static MOCK_BIN: LazyLock<Arc<Vec<u8>>> = LazyLock::new(|| {
+        // Create a temp directory to hold the source and the output
+        let tempdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
+        let source_path = tempdir.path().join("in.rs");
+        let dest_path = tempdir.path().join(format!("out{EXE_SUFFIX}"));
 
-            // Write the source
-            let source = include_bytes!("mock_bin_src.rs");
-            fs::write(&source_path, &source[..]).unwrap();
+        // Write the source
+        let source = include_bytes!("mock_bin_src.rs");
+        fs::write(&source_path, &source[..]).unwrap();
 
-            // Create the executable
-            let status = Command::new("rustc")
-                .arg(&source_path)
-                .arg("-C").arg("panic=abort")
-                .arg("-O")
-                .arg("-o").arg(&dest_path)
-                .status()
-                .unwrap();
-            assert!(status.success());
-            assert!(dest_path.exists());
+        // Create the executable
+        let status = Command::new("rustc")
+            .arg(&source_path)
+            .arg("-C")
+            .arg("panic=abort")
+            .arg("-O")
+            .arg("-o")
+            .arg(&dest_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(dest_path.exists());
 
-            // Remove debug info from std/core which included in every programs,
-            // otherwise we just ignore the return result here
-            if cfg!(unix) {
-                drop(Command::new("strip").arg(&dest_path).status());
-            }
+        // Remove debug info from std/core which included in every programs,
+        // otherwise we just ignore the return result here
+        if cfg!(unix) {
+            drop(Command::new("strip").arg(&dest_path).status());
+        }
 
-            // Now load it into memory
-            let buf = fs::read(dest_path).unwrap();
-            Arc::new(buf)
-        };
-    }
+        // Now load it into memory
+        let buf = fs::read(dest_path).unwrap();
+        Arc::new(buf)
+    });
 
     let name = format!("bin/{name}{EXE_SUFFIX}");
     vec![

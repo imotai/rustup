@@ -4,12 +4,12 @@ use std::io::Write;
 use rustup::dist::component::Components;
 use rustup::dist::component::Transaction;
 use rustup::dist::component::{DirectoryPackage, Package};
-use rustup::dist::dist::DEFAULT_DIST_SERVER;
 use rustup::dist::prefix::InstallPrefix;
 use rustup::dist::temp;
 use rustup::dist::Notification;
-use rustup::utils::utils;
-use rustup_macros::integration_test as test;
+use rustup::dist::DEFAULT_DIST_SERVER;
+use rustup::process::TestProcess;
+use rustup::utils;
 
 use rustup::test::mock::{MockComponentBuilder, MockFile, MockInstallerBuilder};
 
@@ -111,13 +111,14 @@ fn basic_install() {
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
     let tmpdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-    let tmpcfg = temp::Cfg::new(
+    let tmp_cx = temp::Context::new(
         tmpdir.path().to_owned(),
         DEFAULT_DIST_SERVER,
         Box::new(|_| ()),
     );
     let notify = |_: Notification<'_>| ();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
+    let tp = TestProcess::default();
+    let tx = Transaction::new(prefix.clone(), &tmp_cx, &notify, &tp.process);
 
     let components = Components::open(prefix).unwrap();
 
@@ -157,13 +158,14 @@ fn multiple_component_install() {
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
     let tmpdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-    let tmpcfg = temp::Cfg::new(
+    let tmp_cx = temp::Context::new(
         tmpdir.path().to_owned(),
         DEFAULT_DIST_SERVER,
         Box::new(|_| ()),
     );
     let notify = |_: Notification<'_>| ();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
+    let tp = TestProcess::default();
+    let tx = Transaction::new(prefix.clone(), &tmp_cx, &notify, &tp.process);
 
     let components = Components::open(prefix).unwrap();
 
@@ -207,13 +209,14 @@ fn uninstall() {
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
     let tmpdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-    let tmpcfg = temp::Cfg::new(
+    let tmp_cx = temp::Context::new(
         tmpdir.path().to_owned(),
         DEFAULT_DIST_SERVER,
         Box::new(|_| ()),
     );
     let notify = |_: Notification<'_>| ();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
+    let tp = TestProcess::default();
+    let tx = Transaction::new(prefix.clone(), &tmp_cx, &notify, &tp.process);
 
     let components = Components::open(prefix.clone()).unwrap();
 
@@ -225,9 +228,10 @@ fn uninstall() {
 
     // Now uninstall
     let notify = |_: Notification<'_>| ();
-    let mut tx = Transaction::new(prefix, &tmpcfg, &notify);
+    let tp = TestProcess::default();
+    let mut tx = Transaction::new(prefix.clone(), &tmp_cx, &notify, &tp.process);
     for component in components.list().unwrap() {
-        tx = component.uninstall(tx).unwrap();
+        tx = component.uninstall(tx, &tp.process).unwrap();
     }
     tx.commit();
 
@@ -264,13 +268,14 @@ fn component_bad_version() {
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
     let tmpdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-    let tmpcfg = temp::Cfg::new(
+    let tmp_cx = temp::Context::new(
         tmpdir.path().to_owned(),
         DEFAULT_DIST_SERVER,
         Box::new(|_| ()),
     );
     let notify = |_: Notification<'_>| ();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
+    let tp = TestProcess::default();
+    let tx = Transaction::new(prefix.clone(), &tmp_cx, &notify, &tp.process);
 
     let components = Components::open(prefix.clone()).unwrap();
 
@@ -310,13 +315,14 @@ fn install_to_prefix_that_does_not_exist() {
     let prefix = InstallPrefix::from(does_not_exist.clone());
 
     let tmpdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-    let tmpcfg = temp::Cfg::new(
+    let tmp_cx = temp::Context::new(
         tmpdir.path().to_owned(),
         DEFAULT_DIST_SERVER,
         Box::new(|_| ()),
     );
     let notify = |_: Notification<'_>| ();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
+    let tp = TestProcess::default();
+    let tx = Transaction::new(prefix.clone(), &tmp_cx, &notify, &tp.process);
 
     let components = Components::open(prefix).unwrap();
 

@@ -40,12 +40,10 @@ mod imp {
     use std::mem;
     use std::ptr;
 
-    use winapi::shared::minwindef::*;
-    use winapi::um::handleapi::*;
-    use winapi::um::jobapi2::*;
-    use winapi::um::processthreadsapi::*;
-    use winapi::um::winnt::HANDLE;
-    use winapi::um::winnt::*;
+    use tracing::info;
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::System::JobObjects::*;
+    use windows_sys::Win32::System::Threading::*;
 
     pub(crate) struct Setup {
         job: Handle,
@@ -85,8 +83,8 @@ mod imp {
         let r = SetInformationJobObject(
             job.inner,
             JobObjectExtendedLimitInformation,
-            &mut info as *mut _ as LPVOID,
-            mem::size_of_val(&info) as DWORD,
+            &mut info as *mut _ as *const std::ffi::c_void,
+            mem::size_of_val(&info) as u32,
         );
         if r == 0 {
             return None;
@@ -114,8 +112,8 @@ mod imp {
                 let r = SetInformationJobObject(
                     self.job.inner,
                     JobObjectExtendedLimitInformation,
-                    &mut info as *mut _ as LPVOID,
-                    mem::size_of_val(&info) as DWORD,
+                    &mut info as *mut _ as *const std::ffi::c_void,
+                    mem::size_of_val(&info) as u32,
                 );
                 if r == 0 {
                     info!("failed to configure job object to defaults: {}", last_err());

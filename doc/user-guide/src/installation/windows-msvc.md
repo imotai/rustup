@@ -8,13 +8,14 @@ For `msvc` targets these can be acquired through Visual Studio.
 If you don't have Visual Studio already installed then [rustup-init] will offer to automatically install the prerequisites.
 Doing so means you can skip the rest of this page.
 However, it installs Visual Studio Community edition which may not be appropriate for all users.
-It is free for individuals, academic and open source use but other uses, such as in proprietary enterprise software, should ask their organisation which edition is right for them.
+It is free for individuals, academic and open source use, but not for other uses, such as in proprietary enterprise software.
+Users should ask their organisation which edition is right for them.
 See [licensing terms][vs licences] for more details.
 
 ## Manual install
 
 [Download Visual Studio][vs downloads].
-Rust supports Visual Studio 2013 and later but it is recommended that you use the latest version (currently 2022) for new projects.
+Rust supports Visual Studio 2017 and later but it is recommended that you use the latest version (currently 2022) for new projects.
 You can opt to download only the Build Tools for Visual Studio, which does not include the IDE.
 However this requires you already have a license to the Community, Professional or Enterprise edition.
 
@@ -51,11 +52,16 @@ Note that the specific version of the Windows SDK doesn't matter for pure Rust c
 ![Select the latest MSVC component](images/component-msvc.png)
 ![Select the Windows 11 SDK component](images/component-sdk.png)
 
-### Completing the install
+### Adding Language Packs (optional)
 
-After choosing the components, switch to the "Language Packs" tab and add the English language pack in addition to your preferred language.
+After choosing the components, you may also want to select the language packs to install.
+Switch to the "Language Packs" tab and add the languages.
+It is recommended that you add the English language pack in addition to your preferred language.
+This will provide English language error messages, which may help when reporting errors.
 
 ![Add the English language](images/step4.png)
+
+### Completing the install
 
 Finally click the install button and wait for everything to be installed.
 
